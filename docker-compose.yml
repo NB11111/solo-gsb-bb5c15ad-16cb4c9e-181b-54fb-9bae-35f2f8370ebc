@@ -12,6 +12,8 @@ services:
       SECURE_REQUEST_TIMESTAMP_SKEW: "${SECURE_REQUEST_TIMESTAMP_SKEW:-300}"
       # nonce 保留窗口（秒），默认 2 倍时间偏差。
       SECURE_REQUEST_NONCE_TTL: "${SECURE_REQUEST_NONCE_TTL:-600}"
+      # nonce 防重放表容量（占位 + 已成功记录的总条目数上限），默认 10000。
+      SECURE_REQUEST_NONCE_CAPACITY: "${SECURE_REQUEST_NONCE_CAPACITY:-10000}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status==200 else 1)"]

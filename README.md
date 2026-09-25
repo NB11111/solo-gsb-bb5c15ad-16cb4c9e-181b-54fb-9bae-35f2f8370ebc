@@ -32,8 +32,10 @@
 - `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
   （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
-  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
-  执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
+  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放（进程内
+  防重放表有容量上限，占满且无过期项可清理时拒绝新请求，不驱逐未过期
+  nonce）。验签通过后执行对应操作并**原样返回该操作的响应**。`/plan` 与
+  `/assemble` 行为不受影响。
 - `POST /safe-download-name`：解析上游 `Content-Disposition` 响应头，返回可
   直接用作本地下载文件名的**单一安全名称**。优先采用符合 RFC 5987 的
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
@@ -111,6 +113,7 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
 | `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
+| `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | nonce 防重放表（占位与已成功记录共用）的最大条目数；占满且无过期项可清理时，新 nonce 的请求返回 `503 nonce_capacity_exceeded`，不驱逐未过期 nonce |
 
 未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
 `/range-response` 等端点仍正常工作，但 `/secure-request` 返回
@@ -756,13 +759,20 @@ envelope["signature"] = hmac.new(
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
 5. 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
    → `409 nonce_replayed`；
-6. 校验 `payload` 并执行对应操作：字段错误返回 `422 invalid_request`
+6. 防重放表中的未过期记录（占位 + 已成功）已达
+   `SECURE_REQUEST_NONCE_CAPACITY` → `503 nonce_capacity_exceeded`
+   （不驱逐未过期 nonce，也不执行 payload）；
+7. 校验 `payload` 并执行对应操作：字段错误返回 `422 invalid_request`
    （错误路径以 `payload.` 开头，如 `payload.ranges[0].end`），
    业务语义错误沿用 `/plan`、`/assemble` 的 `422` 错误结构。
 
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
-重试。重放已成功的 nonce 返回 `409`。
+重试。重放已成功的 nonce 返回 `409`。防重放表（占位与已成功记录共用）
+的容量由 `SECURE_REQUEST_NONCE_CAPACITY` 限制（默认 10000）：每个请求
+在同一把锁内先清理过期项、再判断重放与容量，然后才为新 nonce 预留
+名额；表满且没有可清理的过期项时返回 `503 nonce_capacity_exceeded`，
+绝不驱逐未过期 nonce，过期记录被清理后容量即刻恢复。
 
 ### `POST /safe-download-name`
 
@@ -1518,6 +1528,7 @@ python examples/cache_read_plan_example.py
 | 401  | `invalid_signature`   | HMAC-SHA256 签名不符                              |
 | 409  | `nonce_replayed`      | 同一 `key_id+nonce` 在有效窗口内已成功使用（附 `key_id`） |
 | 503  | `keys_not_configured` | 服务端未配置 `SECURE_REQUEST_KEYS`，鉴权入口不可用 |
+| 503  | `nonce_capacity_exceeded` | nonce 防重放表已满（达到 `SECURE_REQUEST_NONCE_CAPACITY`）且无过期项可清理（附 `nonce_capacity`） |
 
 `/secure-request` 信封本身字段缺失或类型错误（如缺少 `signature`、
 `timestamp` 不是整数）同样返回 `422 invalid_request`。
