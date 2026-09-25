@@ -75,15 +75,23 @@
 
 ## Docker 一键启动
 
-需要 Docker 20.10+（支持 Compose v2）。**单条命令**即可构建并后台启动：
+需要 Docker 20.10+（支持 Compose v2）。在工作目录准备好 `.env`（可从
+`.env.example` 复制；只需 `/plan`、`/assemble` 等无鉴权端点时也可留空），
+再用**单条命令**构建并后台启动：
 
 ```
 docker compose up --build -d
 ```
 
-- 访问地址：http://127.0.0.1:8080 （仅绑定本机回环地址）
+- 访问地址：http://127.0.0.1:8080 （服务监听容器内 8080 端口，Compose
+  映射 `127.0.0.1:8080:8080`，仅绑定本机回环地址，不对局域网/公网暴露）
 - 接口文档（Swagger UI）：http://127.0.0.1:8080/docs
 - 健康检查：`curl http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
+
+`/secure-request` 的 `SECURE_REQUEST_KEYS` /
+`SECURE_REQUEST_TIMESTAMP_SKEW` / `SECURE_REQUEST_NONCE_TTL` /
+`SECURE_REQUEST_NONCE_CAPACITY` 均由 Compose 从同目录 `.env` 读取（默认值
+见下节“配置”），无需修改 `docker-compose.yml`。
 
 查看日志与停止：
 
@@ -111,6 +119,7 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
 | `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
+| `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | 进程内 nonce 防重放表的容量上限（正整数）；**进行中占位与窗口内已成功 nonce 统一计数**，容量已满且无过期项可清理时返回 `503 nonce_capacity_exceeded`（附 `capacity`），不会驱逐任何未过期 nonce |
 
 未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
 `/range-response` 等端点仍正常工作，但 `/secure-request` 返回
@@ -754,15 +763,21 @@ envelope["signature"] = hmac.new(
    → `401 timestamp_skew`（响应附带 `server_time` 与 `max_skew_seconds`）；
 3. `key_id` 在密钥表中不存在 → `401 unknown_key_id`；
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
-5. 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
-   → `409 nonce_replayed`；
+5. 在**同一把锁内**依次完成 nonce 处理：先清理所有已过期 nonce → 再识别
+   重放 → 最后为新 nonce 预留名额：
+   - 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
+     → `409 nonce_replayed`（即使容量已满，重放仍优先返回 `409`）；
+   - 防重放表达到 `SECURE_REQUEST_NONCE_CAPACITY`（进行中占位与已成功
+     nonce 合计）且清理后仍无空位 → `503 nonce_capacity_exceeded`（附
+     `capacity`），**不执行 payload、也不驱逐任何未过期 nonce**；
 6. 校验 `payload` 并执行对应操作：字段错误返回 `422 invalid_request`
    （错误路径以 `payload.` 开头，如 `payload.ranges[0].end`），
    业务语义错误沿用 `/plan`、`/assemble` 的 `422` 错误结构。
 
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
-重试。重放已成功的 nonce 返回 `409`。
+重试。回滚只删除请求自己的占位：若该占位恰好已过期并被并发请求重新占用，
+原有记录不会被误删。重放已成功的 nonce 返回 `409`。
 
 ### `POST /safe-download-name`
 
@@ -1518,6 +1533,7 @@ python examples/cache_read_plan_example.py
 | 401  | `invalid_signature`   | HMAC-SHA256 签名不符                              |
 | 409  | `nonce_replayed`      | 同一 `key_id+nonce` 在有效窗口内已成功使用（附 `key_id`） |
 | 503  | `keys_not_configured` | 服务端未配置 `SECURE_REQUEST_KEYS`，鉴权入口不可用 |
+| 503  | `nonce_capacity_exceeded` | nonce 防重放表已达容量上限且无过期项可清理（附 `capacity`），不驱逐未过期 nonce、不执行 payload |
 
 `/secure-request` 信封本身字段缺失或类型错误（如缺少 `signature`、
 `timestamp` 不是整数）同样返回 `422 invalid_request`。

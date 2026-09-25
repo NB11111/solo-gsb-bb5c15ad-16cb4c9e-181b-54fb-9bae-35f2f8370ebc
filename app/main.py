@@ -35,6 +35,9 @@ POST /secure-request 是 /plan 与 /assemble 的统一鉴权入口：请求携�
 operation（plan 或 assemble）、payload（即原接口请求体）、key_id、
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
 HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
+防重放表为有界容量（进行中占位与窗口内已成功 nonce 合计，默认 10000）：
+同一把锁内先清理过期项、再识别重放、最后为新 nonce 预留名额；容量已满
+且无过期项时返回 503 nonce_capacity_exceeded，绝不驱逐未过期 nonce。
 验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
 
 POST /multipart-parse 解析上游返回的 multipart/byteranges 完整响应体
@@ -145,6 +148,8 @@ class SecureRequestConfig:
       原始 UTF-8 密钥字节（如含特殊字符建议用仅含字母数字/base64 字符的密钥）。
     - SECURE_REQUEST_TIMESTAMP_SKEW：允许的时间偏差（秒），默认 300。
     - SECURE_REQUEST_NONCE_TTL：nonce 保留时长（秒），默认取 2 倍偏差。
+    - SECURE_REQUEST_NONCE_CAPACITY：进程内 nonce 防重放表的容量上限
+      （进行中占位与窗口内已成功 nonce 合计），默认 10000。
     """
 
     def __init__(self) -> None:
@@ -173,19 +178,61 @@ class SecureRequestConfig:
             raise RuntimeError("SECURE_REQUEST_NONCE_TTL 必须为正整数")
         self.nonce_ttl = nonce_ttl
 
+        nonce_capacity = int(os.environ.get("SECURE_REQUEST_NONCE_CAPACITY", "10000"))
+        if nonce_capacity < 1:
+            raise RuntimeError("SECURE_REQUEST_NONCE_CAPACITY 必须为正整数")
+        self.nonce_capacity = nonce_capacity
+
 
 secure_config = SecureRequestConfig()
 
-# 进程内 nonce 防重放存储：(key_id, nonce) -> 成功/占用的到期时间戳。
+# 进程内 nonce 防重放存储：(key_id, nonce) -> (到期时间戳, 占位令牌)。
+# 占位令牌随每次预留重新生成：失败请求只能释放自己的占位，避免在其占位
+# 过期后误删被并发请求重新占用（甚至已成功）的同名记录。
 _nonce_lock = threading.Lock()
-_nonce_seen: dict[tuple[str, str], float] = {}
+_nonce_seen: dict[tuple[str, str], tuple[float, int]] = {}
 
 
 def _sweep_nonces(now: float) -> None:
     """清理已过期 nonce（调用方需持有 _nonce_lock）。"""
-    expired = [k for k, expiry in _nonce_seen.items() if expiry <= now]
+    expired = [k for k, (expiry, _token) in _nonce_seen.items() if expiry <= now]
     for k in expired:
         del _nonce_seen[k]
+
+
+def _reserve_nonce(
+    nonce_key: tuple[str, str], now: float
+) -> tuple[str, tuple[float, int] | None]:
+    """在同一把锁内完成防重放判断与名额预留（调用方需持有 _nonce_lock）。
+
+    顺序固定为：先清理过期项 → 再识别重放 → 最后为新 nonce 预留名额。
+    容量统计同时包含进行中的占位与窗口内已成功的 nonce；容量已满且没有
+    任何过期项可清理时返回 ``("full", None)``（调用方据此返回 503，绝不
+    驱逐未过期 nonce）；重放返回 ``("replayed", None)``（409 优先于 503）；
+    预留成功返回 ``("reserved", (到期时间戳, 占位令牌))``。
+    """
+    _sweep_nonces(now)
+    if nonce_key in _nonce_seen:
+        return "replayed", None
+    if len(_nonce_seen) >= secure_config.nonce_capacity:
+        return "full", None
+    token = secrets.randbits(64)
+    expiry = now + secure_config.nonce_ttl
+    reservation = (expiry, token)
+    _nonce_seen[nonce_key] = reservation
+    return "reserved", reservation
+
+
+def _release_nonce(
+    nonce_key: tuple[str, str], reservation: tuple[float, int]
+) -> None:
+    """释放本次失败请求自己的占位（调用方需持有 _nonce_lock）。
+
+    仅当存储中的记录与本次预留（到期时间戳 + 占位令牌）逐字一致时才删除；
+    若该记录已过期并被并发请求重新占用，则保持不动。
+    """
+    if _nonce_seen.get(nonce_key) == reservation:
+        del _nonce_seen[nonce_key]
 
 
 # ----------------------------- 公共类型 -----------------------------
@@ -2627,19 +2674,31 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
         )
 
     # 4. nonce 防重放：同一 key_id+nonce 在有效窗口内只能成功一次。
-    #    先占位；若后续 payload 校验或操作执行失败则回滚，避免失败请求
-    #    白白消耗 nonce（只有真正成功的请求才永久占用）。
+    #    在同一把锁内完成“清理过期项 → 识别重放 → 为新 nonce 预留名额”，
+    #    避免清理/判重/占位之间出现并发窗口。先占位；若后续 payload 校验或
+    #    操作执行失败则回滚，避免失败请求白白消耗 nonce（只有真正成功的
+    #    请求才永久占用）。容量对进行中占位与窗口内已成功 nonce 统一计数，
+    #    已满且无过期项时拒绝执行（503），绝不驱逐任何未过期 nonce；
+    #    409 重放优先于 503 容量不足。
     nonce_key = (raw.key_id, raw.nonce)
     with _nonce_lock:
-        _sweep_nonces(now)
-        if nonce_key in _nonce_seen:
+        status, reservation = _reserve_nonce(nonce_key, now)
+        if status == "replayed":
             return _auth_error(
                 "nonce_replayed",
                 f"key_id={raw.key_id!r} 的 nonce 已在有效窗口内使用过",
                 status_code=409,
                 key_id=raw.key_id,
             )
-        _nonce_seen[nonce_key] = now + secure_config.nonce_ttl
+        if status == "full":
+            return _auth_error(
+                "nonce_capacity_exceeded",
+                "nonce 防重放表已达容量上限且没有可清理的过期 nonce，"
+                "请稍后重试",
+                status_code=503,
+                capacity=secure_config.nonce_capacity,
+            )
+        assert reservation is not None
 
     try:
         # 5. 鉴权通过：用 payload 校验对应操作的模型（失败返回带 payload
@@ -2668,15 +2727,16 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
             )
     except BaseException:
         # 业务异常（PlanningError/AssemblyError 等 422）或其他异常：
-        # 本次请求未成功，释放 nonce 占位，允许客户端修正后用同一 nonce 重试。
+        # 本次请求未成功，释放自己的 nonce 占位（记录已被并发请求重新
+        # 占用时不动），允许客户端修正后用同一 nonce 重试。
         with _nonce_lock:
-            _nonce_seen.pop(nonce_key, None)
+            _release_nonce(nonce_key, reservation)
         raise
 
-    # payload 校验失败（未执行任何操作）：同样回滚 nonce 占位。
+    # payload 校验失败（未执行任何操作）：同样回滚自己的 nonce 占位。
     if response.status_code != 200:
         with _nonce_lock:
-            _nonce_seen.pop(nonce_key, None)
+            _release_nonce(nonce_key, reservation)
     return response
 
 
